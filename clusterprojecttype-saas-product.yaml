@@ -1,0 +1,403 @@
+# =============================================================================
+# ClusterProjectType: saas-product
+# -----------------------------------------------------------------------------
+# A platform team's "golden path" for shipping a SaaS product.
+#
+# Why "saas-product"? In OpenChoreo a Project IS a cloud-native application
+# composed of many components — and a SaaS product is exactly that: a
+# customer-facing product delivered as a set of cooperating components
+# (frontend, APIs, workers, jobs) that are released, scaled, and governed
+# together, and promoted across environments as one unit. The name names the
+# whole product, sitting one level above the individual services inside it —
+# never a single deployable. Every feature below is a thing a SaaS product
+# needs, not a thing a service needs:
+#
+#   * Cost governance    ResourceQuota + LimitRange, sized per environment —
+#                        so each product's spend is capped and attributable.
+#   * Zero-trust egress  default-deny, then an explicit allowlist:
+#                          - cluster DNS (always)
+#                          - the product's approved 3rd-party integrations and
+#                            data stores (one policy each, generated with
+#                            forEach over the product's declared dependencies)
+#                          - unrestricted internet egress (dev only, opt-in)
+#   * Gateway ingress    only the platform edge may reach the product's cell
+#   * Governance         team / cost-center / data-classification labels for
+#                        chargeback and compliance, enforced by CEL validations
+#                        (SaaS products hold customer data — classification
+#                        drives posture, e.g. "restricted" bars open egress).
+#   * Shared config      a platform ConfigMap injected into every cell
+#   * Secret sync        optional ExternalSecret wired to the DataPlane store
+#
+# It exercises every ProjectType capability: parameters, environmentConfigs,
+# validations, and resources using includeWhen, forEach/var, the full CEL
+# context (${parameters.*}, ${environmentConfigs.*}, ${metadata.*},
+# ${dataplane.*}, ${environment.*}, ${gateway.*}) and the oc_* helpers.
+#
+# MANDATE: spec.resources[] must render a v1/Namespace whose metadata.name is
+# the literal placeholder ${metadata.namespace}. Without it the binding goes
+# Synced=False (NamespaceMissing).
+# =============================================================================
+apiVersion: openchoreo.dev/v1alpha1
+kind: ClusterProjectType
+metadata:
+  name: saas-product
+  annotations:
+    openchoreo.dev/display-name: SaaS Product
+    openchoreo.dev/description: >-
+      Golden-path project type for shipping a SaaS product: an isolated,
+      cost-attributed, zero-trust cell namespace with an explicit egress
+      allowlist for the product's integrations, per-environment quotas, and
+      governance labels for chargeback and compliance.
+spec:
+  # ---------------------------------------------------------------------------
+  # parameters — project-wide inputs the developer sets once on
+  # Project.spec.parameters. Snapshotted into every ProjectRelease and exposed
+  # to templates as ${parameters.*}.
+  # ---------------------------------------------------------------------------
+  parameters:
+    openAPIV3Schema:
+      type: object
+      required: [team]
+      properties:
+        # Owning team — required; drives chargeback labels. No default, so a
+        # Project of this type must declare who owns it.
+        team:
+          type: string
+        costCenter:
+          type: string
+          default: "0000"
+        # Governs the compute ceiling (see the "standard tier is capped"
+        # validation below).
+        tier:
+          type: string
+          enum: [standard, premium]
+          default: standard
+        # Real-world governance knob — the "restricted" class forbids
+        # unrestricted internet egress in any environment (enforced below).
+        dataClassification:
+          type: string
+          enum: [internal, confidential, restricted]
+          default: internal
+        # The egress allowlist. Each entry becomes its own NetworkPolicy via
+        # the `dependency-egress` forEach template — e.g. a payment gateway,
+        # a partner API, or a managed database's published CIDR.
+        dependencies:
+          type: array
+          default: []
+          items:
+            type: object
+            required: [name, cidr, port]
+            properties:
+              name:
+                type: string
+              cidr:
+                type: string
+              port:
+                type: integer
+        observability:
+          type: object
+          default: {}
+          properties:
+            logLevel:
+              type: string
+              enum: [debug, info, warn, error]
+              default: info
+        # Drives the optional shared-cell ExternalSecret.
+        externalSecrets:
+          type: object
+          default: {}
+          properties:
+            enabled:
+              type: boolean
+              default: false
+            keys:
+              type: array
+              default: []
+              items:
+                type: string
+
+  # ---------------------------------------------------------------------------
+  # environmentConfigs — per-environment overrides the platform engineer sets
+  # on each ProjectReleaseBinding.spec.environmentConfigs. Exposed as
+  # ${environmentConfigs.*}. This is how dev stays cheap and open while prod
+  # is large and locked down — same project, same release, different posture.
+  # ---------------------------------------------------------------------------
+  environmentConfigs:
+    openAPIV3Schema:
+      type: object
+      properties:
+        cpuQuota:
+          type: string
+          default: "4"
+        memoryQuota:
+          type: string
+          default: "8Gi"
+        maxPods:
+          type: integer
+          default: 50
+        defaultContainerCPU:
+          type: string
+          default: "500m"
+        defaultContainerMemory:
+          type: string
+          default: "512Mi"
+        # Opt-in, per environment: allow unrestricted internet egress. Expected
+        # true in dev, false in staging/prod.
+        allowInternetEgress:
+          type: boolean
+          default: false
+        extraNamespaceLabels:
+          type: object
+          additionalProperties:
+            type: string
+          default: {}
+
+  # ---------------------------------------------------------------------------
+  # validations — CEL rules evaluated before rendering. Every rule must be
+  # true; a failure blocks the render and surfaces `message` on the binding.
+  # Rules may span both ${parameters.*} and ${environmentConfigs.*}.
+  # ---------------------------------------------------------------------------
+  validations:
+    - rule: "${environmentConfigs.cpuQuota.matches('^[0-9]+$')}"
+      message: 'cpuQuota must be an integer string (e.g. "4", "8")'
+    - rule: "${environmentConfigs.maxPods > 0 && environmentConfigs.maxPods <= 500}"
+      message: "maxPods must be between 1 and 500"
+    - rule: "${parameters.tier == 'premium' || int(environmentConfigs.cpuQuota) <= 8}"
+      message: "standard tier is capped at cpuQuota 8 — upgrade to premium for more"
+    # Governance: restricted-data projects can never open the internet.
+    - rule: "${parameters.dataClassification != 'restricted' || !environmentConfigs.allowInternetEgress}"
+      message: "restricted data classification forbids allowInternetEgress"
+    - rule: "${parameters.dependencies.all(d, d.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'))}"
+      message: "dependencies[].name must be a valid DNS-1123 label"
+    - rule: "${!parameters.externalSecrets.enabled || size(parameters.externalSecrets.keys) > 0}"
+      message: "externalSecrets.keys must be non-empty when externalSecrets.enabled is true"
+
+  # ---------------------------------------------------------------------------
+  # resources — the manifests applied to the cell namespace this project owns
+  # on each environment.
+  # ---------------------------------------------------------------------------
+  resources:
+    # 1. Mandated cell namespace. metadata.name MUST be ${metadata.namespace}.
+    #    oc_merge stacks platform labels + per-env labels + governance labels;
+    #    the cost-center rides along as an annotation.
+    - id: cell-namespace
+      template:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: ${metadata.namespace}
+          labels: '${oc_merge(metadata.labels, environmentConfigs.extraNamespaceLabels, {"openchoreo.dev/team": parameters.team, "openchoreo.dev/tier": parameters.tier, "openchoreo.dev/data-classification": parameters.dataClassification})}'
+          annotations: '${oc_merge(metadata.annotations, {"openchoreo.dev/cost-center": parameters.costCenter})}'
+
+    # 2. Per-env compute ceiling.
+    - id: resource-quota
+      template:
+        apiVersion: v1
+        kind: ResourceQuota
+        metadata:
+          name: cell-quota
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          hard:
+            requests.cpu: ${environmentConfigs.cpuQuota}
+            requests.memory: ${environmentConfigs.memoryQuota}
+            limits.cpu: ${environmentConfigs.cpuQuota}
+            limits.memory: ${environmentConfigs.memoryQuota}
+            pods: ${environmentConfigs.maxPods}
+
+    # 3. Container defaults so workloads without explicit requests still fit
+    #    the quota above.
+    - id: limit-range
+      template:
+        apiVersion: v1
+        kind: LimitRange
+        metadata:
+          name: cell-defaults
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          limits:
+            - type: Container
+              defaultRequest:
+                cpu: ${environmentConfigs.defaultContainerCPU}
+                memory: ${environmentConfigs.defaultContainerMemory}
+              default:
+                cpu: ${environmentConfigs.defaultContainerCPU}
+                memory: ${environmentConfigs.defaultContainerMemory}
+
+    # 4. Zero-trust baseline: nothing leaves the cell unless a later policy
+    #    below explicitly allows it.
+    - id: default-deny-egress
+      template:
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        metadata:
+          name: default-deny-egress
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          podSelector: {}
+          policyTypes: [Egress]
+          egress: []
+
+    # 5. Always allow cluster DNS — without this nothing in the cell resolves.
+    - id: allow-dns-egress
+      template:
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        metadata:
+          name: allow-dns-egress
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          podSelector: {}
+          policyTypes: [Egress]
+          egress:
+            - to:
+                - namespaceSelector:
+                    matchLabels:
+                      kubernetes.io/metadata.name: kube-system
+              ports:
+                - protocol: UDP
+                  port: 53
+                - protocol: TCP
+                  port: 53
+
+    # 6. forEach — one egress NetworkPolicy per approved external dependency.
+    #    Each iteration binds the item to ${dep}; ids are suffixed by index
+    #    (dependency-egress-0, dependency-egress-1, …). dep.name is already
+    #    validated as a DNS-1123 label above, so the policy name is a simple,
+    #    predictable concatenation: allow-egress-<dep.name>.
+    - id: dependency-egress
+      forEach: "${parameters.dependencies}"
+      var: dep
+      template:
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        metadata:
+          name: ${"allow-egress-" + dep.name}
+          namespace: ${metadata.namespace}
+          labels: '${oc_merge(metadata.labels, {"openchoreo.dev/dependency": dep.name})}'
+        spec:
+          podSelector: {}
+          policyTypes: [Egress]
+          egress:
+            - to:
+                - ipBlock:
+                    cidr: ${dep.cidr}
+              ports:
+                - protocol: TCP
+                  port: ${dep.port}
+
+    # 7. Conditional — unrestricted internet egress, opt-in per environment
+    #    (expected on in dev, off in prod). Guarded by the environmentConfig
+    #    flag; the restricted-data validation above stops it being combined
+    #    with restricted workloads.
+    - id: allow-internet-egress
+      includeWhen: "${environmentConfigs.allowInternetEgress}"
+      template:
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        metadata:
+          name: allow-internet-egress
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          podSelector: {}
+          policyTypes: [Egress]
+          egress:
+            - {}
+
+    # 8. Conditional — only the platform gateway may reach the cell. Rendered
+    #    only where the resolved environment/dataplane actually exposes an
+    #    ingress gateway. Guard presence with has(environment.gateway.*),
+    #    never has(gateway) (the top-level ${gateway} may be absent).
+    - id: allow-ingress-from-gateway
+      includeWhen: "${has(environment.gateway) && has(environment.gateway.ingress) && has(environment.gateway.ingress.external)}"
+      template:
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        metadata:
+          name: allow-ingress-from-gateway
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          podSelector: {}
+          policyTypes: [Ingress]
+          ingress:
+            - from:
+                - namespaceSelector:
+                    matchLabels:
+                      kubernetes.io/metadata.name: ${gateway.ingress.external.namespace}
+
+    # 9. Shared platform config injected into every cell — teams read a
+    #    consistent set of values (log level, ownership, environment identity)
+    #    without each project redefining them. Shows the ${metadata.*} identity
+    #    surface.
+    - id: platform-config
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: platform-config
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        data:
+          team: ${parameters.team}
+          cost-center: ${parameters.costCenter}
+          log-level: ${parameters.observability.logLevel}
+          data-classification: ${parameters.dataClassification}
+          project: ${metadata.projectName}
+          environment: ${metadata.environmentName}
+
+    # 10. Conditional shared-cell secret sync, wired to the DataPlane's ESO
+    #     ClusterSecretStore via ${dataplane.secretStore}. Guarded so the type
+    #     still renders on DataPlanes with no secret store configured.
+    - id: shared-secrets
+      includeWhen: "${parameters.externalSecrets.enabled && has(dataplane.secretStore)}"
+      template:
+        apiVersion: external-secrets.io/v1
+        kind: ExternalSecret
+        metadata:
+          name: cell-shared-secrets
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          refreshInterval: 1h
+          secretStoreRef:
+            kind: ClusterSecretStore
+            name: ${dataplane.secretStore}
+          target:
+            name: cell-shared-secrets
+            creationPolicy: Owner
+          data: '${parameters.externalSecrets.keys.map(k, {"secretKey": k, "remoteRef": {"key": metadata.projectName + "/" + metadata.environmentName + "/" + k}})}'
+
+# =============================================================================
+# Companion Project for the demo (apply after this ClusterProjectType).
+# Sets spec.type to reference this type and supplies parameters, including two
+# approved egress dependencies that fan out into per-dependency NetworkPolicies.
+# =============================================================================
+# apiVersion: openchoreo.dev/v1alpha1
+# kind: Project
+# metadata:
+#   name: storefront
+#   namespace: default
+# spec:
+#   type:
+#     kind: ClusterProjectType
+#     name: saas-product
+#   parameters:
+#     team: commerce
+#     costCenter: "4200"
+#     tier: premium
+#     dataClassification: confidential
+#     observability:
+#       logLevel: info
+#     dependencies:
+#       - name: stripe-api
+#         cidr: 34.194.0.0/16
+#         port: 443
+#       - name: inventory-db
+#         cidr: 10.20.30.0/24
+#         port: 5432
